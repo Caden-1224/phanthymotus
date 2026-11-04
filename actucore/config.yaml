@@ -10,13 +10,15 @@ mcp_port: 15730
 # （provider 改写为 vla_cloud，endpoint 指向本机 loopback）。关闭后卡片完全
 # 按 plugins.vla 里的原配置运行 —— 回滚只改这一个值，不换镜像、不改卡片。
 #
-# 当前只有 mock/delay worker；真实 SmolVLA worker 在下一阶段接进来。
+# 当前支持 mock / delay / smolvla 三种 worker。backend=smolvla 时权重在
+# worker 进程内加载，`/capabilities` 取自 checkpoint 自身，不需要在这里重复。
 runtime:
   enabled: false
   host: 127.0.0.1
   port: 15732
   # mock = 正弦轨迹；delay = 同一轨迹加固定延迟，验证 inference 期间
-  # /healthz、/status 仍然快速响应。
+  # /healthz、/status 仍然快速响应；smolvla = 本机真实 checkpoint（镜像需带
+  # lerobot；worker 默认复用 plugins.vla 的 checkpoint 配置）。
   backend: mock
   delay_ms: 0
   infer_timeout_ms: 5000
@@ -24,9 +26,10 @@ runtime:
   # （0 = 不回收）。下次 infer 会重新拉起 worker。
   monitor_interval_ms: 100
   idle_reap_ms: 60000
-  # /capabilities 的模型身份。action_dim / control_mode / control_hz /
-  # chunk_size 必须与卡片下游的动作空间一致；对不上会在启动协商处被拒绝，
-  # 不会跑起来后一条条失败。mock 不读观测，也不受 image_size 影响。
+  # /capabilities 的模型身份，只用于 mock/delay。smolvla backend 的
+  # capabilities 从 checkpoint config 读取，和原生 provider 是同一份。
+  # action_dim / control_mode / control_hz / chunk_size 必须与卡片下游的
+  # 动作空间一致；对不上会在启动协商处被拒绝，不会跑起来后一条条失败。
   capabilities:
     model: mock-sine@8s
     control_mode: joint_position
@@ -37,6 +40,23 @@ runtime:
     n_cameras: 0
     image_size: 0
     supports_rtc: false
+
+  # ── backend: smolvla ────────────────────────────────────────────────────
+  # 默认直接复用 plugins.vla 的 SmolVLA 配置（model_name / models /
+  # feature_map / unnorm_key / device 等），保证 native 与 runtime 加载的是
+  # **同一个 checkpoint**，不维护第二份身份。只有需要显式 A/B 另一份权重时
+  # 才在下面覆盖：
+  #
+  # smolvla:
+  #   model_name: smolvla_tianyi
+  #   models:
+  #     smolvla_tianyi:
+  #       model_dir: /models/vla/smolvla_tianyi
+  #       unnorm_key: tianyi
+  #       weights: {...}
+  #       feature_map:
+  #         cam0: observation.images.camera1
+  #         state: observation.state
 
 plugins:
   vla:

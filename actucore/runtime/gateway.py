@@ -16,7 +16,8 @@ from urllib.parse import urlsplit
 
 from . import config as runtime_config
 from .session import BusyError, ClosedError, SessionRegistry
-from .supervisor import BackendError, WorkerError, WorkerSupervisor, WorkerTimeout
+from .supervisor import (BackendError, WorkerError, WorkerLoading,
+                         WorkerSupervisor, WorkerTimeout)
 
 log = logging.getLogger(__name__)
 
@@ -93,14 +94,33 @@ class RuntimeGateway:
     # ── HTTP surface ─────────────────────────────────────────────────────────
 
     def capabilities(self) -> dict:
-        return dict(self._capabilities)
+        """What the worker actually loaded, not what the config guessed.
+
+        A real checkpoint owns `action_dim`, `chunk_size`, `image_size` and the
+        rest; copying them into runtime config would be a second source of
+        truth that drifts from the weights. The worker answers hello from the
+        checkpoint's own config, before its weights load, so this is available
+        as soon as the gateway starts.
+        """
+        capabilities = dict(self._capabilities)
+        capabilities.update(self._worker.capabilities)
+        capabilities["schema"] = runtime_config.SCHEMA
+        if "ready" in capabilities:
+            capabilities["ready"] = self._worker.healthy
+        return capabilities
 
     def health(self) -> tuple[int, dict]:
-        if self._worker.alive:
+        state = self._worker.state
+        if self._worker.healthy:
             return 200, {"schema": runtime_config.SCHEMA,
                          "status": "ok", "worker": "ready"}
+        if state == "ready":
+            # The process is up but the checkpoint's weights are still loading.
+            # This is the state the card must show as `loading`, not `running`.
+            return 503, {"schema": runtime_config.SCHEMA,
+                         "status": "loading", "worker": "ready", "healthy": False}
         return 503, {"schema": runtime_config.SCHEMA,
-                     "status": "unavailable", "worker": self._worker.status()["state"]}
+                     "status": "unavailable", "worker": state, "healthy": False}
 
     def status(self) -> dict:
         return {"schema": runtime_config.SCHEMA,
@@ -115,6 +135,14 @@ class RuntimeGateway:
         session_id = str(body.get("session_id") or "")
         if not session_id:
             return 400, _error("missing_session", "infer needs a session_id")
+
+        worker_state = self._worker.state
+        if worker_state == "recovering":
+            return 503, _error("recovering", "the model worker is recovering",
+                               session_id=session_id)
+        if worker_state == "ready" and not self._worker.healthy:
+            return 503, _error("loading", "model weights are still loading",
+                               session_id=session_id)
 
         session = self._sessions.get_or_create(session_id)
         try:
@@ -132,6 +160,9 @@ class RuntimeGateway:
                 return 409, _error("cancelled", "the session was closed", session_id=session_id)
             session.mark_recovering(str(error))
             return 504, _error("timeout", str(error), session_id=session_id)
+        except WorkerLoading as error:
+            session.finish_infer(str(error))
+            return 503, _error("loading", str(error), session_id=session_id)
         except BackendError as error:
             session.finish_infer(str(error))
             return 502, _error("model_error", str(error), session_id=session_id)

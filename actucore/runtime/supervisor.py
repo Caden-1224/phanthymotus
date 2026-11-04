@@ -2,7 +2,7 @@
 
 The gateway must survive the child: a crash marks the worker `recovering`, a
 monitor notices a dead process and spawns a replacement, and sessions are only
-returned to `ready` once that replacement has answered hello. Idle workers are
+returned to `ready` once that replacement's model is healthy. Idle workers are
 reaped on a configured timer so a stopped card does not keep a GPU context.
 """
 
@@ -30,6 +30,10 @@ class WorkerRecovering(WorkerError):
     """The worker is being replaced; the caller should retry after recovery."""
 
 
+class WorkerLoading(WorkerError):
+    """The worker process is up but its model is still loading."""
+
+
 class BackendError(WorkerError):
     """The worker answered, but the model itself failed."""
 
@@ -51,12 +55,16 @@ class WorkerSupervisor:
         self._ctx = mp.get_context("spawn")
         self._process = None
         self._connection = None
+        self._health_connection = None
+        self._healthy = threading.Event()
+        self._capabilities = {}
         self._next_request_id = 0
 
         self._state = "stopped"
         self._restart_count = 0
         self._recovery_started = 0.0
         self._recovery_time_ms = None
+        self._ready_notified = True
         self._last_error = ""
         self._last_activity = time.monotonic()
         self._in_flight = False
@@ -74,6 +82,7 @@ class WorkerSupervisor:
             self._spawn_locked()
             self._state = "ready"
             self._last_activity = time.monotonic()
+            self._ready_notified = self.healthy
         self._monitor = threading.Thread(target=self._monitor_loop,
                                          name="model_worker_monitor", daemon=True)
         self._monitor.start()
@@ -108,12 +117,19 @@ class WorkerSupervisor:
             with self._lock:
                 if self._closed:
                     return
+                self._drain_health_locked()
                 if self._state == "recovering":
                     self._retry_recovery_locked()
                 elif self._state == "ready":
                     if self._process is None or not self._process.is_alive():
                         self._enter_recovering_locked("model worker exited")
                         self._terminate_locked()
+                    elif not self._ready_notified:
+                        # A replacement can answer hello before its weights are
+                        # loaded. Sessions stay `recovering` until health is
+                        # true, which is what stops a card acting on a worker
+                        # that cannot infer yet.
+                        self._mark_ready_locked()
                     elif self._idle_expired_locked():
                         self._terminate_locked()
                         self._state = "stopped"
@@ -128,10 +144,24 @@ class WorkerSupervisor:
             self._last_error = str(error)
             return
         self._state = "ready"
+        self._ready_notified = False
         self._last_activity = time.monotonic()
-        self._recovery_time_ms = int((time.monotonic() - self._recovery_started) * 1000)
-        log.info("[runtime] model worker ready after %dms restart #%d",
-                 self._recovery_time_ms, self._restart_count)
+        self._mark_ready_locked()
+
+    def _mark_ready_locked(self) -> None:
+        """Publish readiness once the model, not just the process, is up."""
+        if self._ready_notified or not self.healthy:
+            return
+        self._ready_notified = True
+        self._last_activity = time.monotonic()
+        if self._recovery_started:
+            self._recovery_time_ms = int(
+                (time.monotonic() - self._recovery_started) * 1000)
+            log.info("[runtime] model worker ready after %dms restart #%d "
+                     "(rss=%sMB)", self._recovery_time_ms, self._restart_count,
+                     self.rss_mb)
+        else:
+            log.info("[runtime] model worker ready (rss=%sMB)", self.rss_mb)
         self._notify(self._on_ready)
 
     def _enter_recovering_locked(self, reason: str) -> None:
@@ -142,6 +172,7 @@ class WorkerSupervisor:
         self._restart_count += 1
         self._recovery_started = time.monotonic()
         self._recovery_time_ms = None
+        self._ready_notified = False
         self._last_error = reason
         log.warning("[runtime] model worker recovering (restart #%d): %s",
                     self._restart_count, reason)
@@ -157,37 +188,81 @@ class WorkerSupervisor:
 
     def _idle_expired_locked(self) -> bool:
         return (self._idle_reap_ms > 0 and not self._in_flight
+                and self._ready_notified
                 and time.monotonic() - self._last_activity > self._idle_reap_ms / 1000.0)
 
     def _spawn_locked(self) -> None:
         parent, child = self._ctx.Pipe(duplex=True)
+        health_parent, health_child = self._ctx.Pipe(duplex=False)
         process = self._ctx.Process(
             target=worker_main,
-            args=(child, self._backend, self._config),
+            args=(child, self._backend, self._config, health_child),
             daemon=True,
             name=f"model_worker_{self._backend}",
         )
-        process.start()
+        try:
+            process.start()
+        except Exception:
+            parent.close()
+            child.close()
+            health_parent.close()
+            health_child.close()
+            raise
         child.close()
+        health_child.close()
 
         if not parent.poll(30):
+            health_parent.close()
             self._kill_process(process, parent)
             raise WorkerError("the model worker did not start within 30s")
         try:
             message = parent.recv()
         except EOFError as error:
+            health_parent.close()
             self._kill_process(process, parent)
             raise WorkerError(f"the model worker exited before hello: {error}") from error
         if message[0] != "hello" or not message[1].get("ok"):
             detail = message[1].get("error", "no hello") if message[0] == "hello" else "bad hello"
+            health_parent.close()
             self._kill_process(process, parent)
             raise WorkerError(f"the model worker failed to start: {detail}")
 
         self._process, self._connection = process, parent
+        self._health_connection = health_parent
+        self._healthy = threading.Event()
+        self._capabilities = dict(message[1].get("capabilities") or {})
+        # The watcher sends its first state before hello, so a mock worker is
+        # healthy by the time `start()` returns and a loading SmolVLA worker is
+        # recorded as not healthy immediately.
+        self._drain_health_locked(0.5)
+
+    def _drain_health_locked(self, wait_s: float = 0) -> None:
+        connection = self._health_connection
+        if connection is None:
+            return
+        try:
+            if wait_s and not connection.poll(wait_s):
+                return
+            while connection.poll(0):
+                message = connection.recv()
+                if message and message[0] == "health":
+                    if message[1]:
+                        self._healthy.set()
+                    else:
+                        self._healthy.clear()
+        except (EOFError, OSError):
+            return
 
     def _terminate_locked(self, graceful: bool = True) -> None:
         process, connection = self._process, self._connection
+        health, self._health_connection = self._health_connection, None
         self._process = self._connection = None
+        self._healthy.clear()
+        if health is not None:
+            try:
+                health.close()
+            except Exception:       # noqa: BLE001 — teardown is best effort
+                pass
         self._kill_process(process, connection, graceful=graceful)
 
     @staticmethod
@@ -235,11 +310,15 @@ class WorkerSupervisor:
                         raise
                     self._state = "ready"
                     self._last_activity = time.monotonic()
+                    self._ready_notified = self.healthy
+                    self._recovery_started = 0.0
                 if self._state == "recovering":
                     raise WorkerRecovering("the model worker is recovering")
                 if not self.alive:
                     self._fail_locked("model worker is not running")
                     raise WorkerRecovering("the model worker is recovering")
+                if not self.healthy:
+                    raise WorkerLoading("the model worker is still loading")
                 self._next_request_id += 1
                 request_id = self._next_request_id
                 connection = self._connection
@@ -285,18 +364,51 @@ class WorkerSupervisor:
         return self._state == "ready" and process is not None and process.is_alive()
 
     @property
+    def healthy(self) -> bool:
+        """Process up *and* the model behind it able to infer."""
+        event = self._healthy
+        return self.alive and event is not None and event.is_set()
+
+    @property
+    def capabilities(self) -> dict:
+        return dict(self._capabilities)
+
+    @property
+    def state(self) -> str:
+        """Public worker phase, including the dead-process correction."""
+        process = self._process
+        state = self._state
+        if state == "ready" and (process is None or not process.is_alive()):
+            return "recovering"
+        return state
+
+    @property
     def pid(self) -> int | None:
         process = self._process
         return process.pid if process is not None else None
 
+    @property
+    def rss_mb(self) -> float | None:
+        """Resident memory of the worker process, or None when unreadable."""
+        pid = self.pid
+        if pid is None:
+            return None
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        return round(int(line.split()[1]) / 1024.0, 1)
+        except OSError:
+            pass
+        return None
+
     def status(self) -> dict:
         process = self._process
-        state = self._state
-        if state == "ready" and (process is None or not process.is_alive()):
-            state = "recovering"
         return {
-            "state": state,
+            "state": self.state,
+            "healthy": self.healthy,
             "pid": process.pid if process is not None else None,
+            "rss_mb": self.rss_mb,
             "restart_count": self._restart_count,
             "recovery_time_ms": self._recovery_time_ms,
             "recovery_time_s": (None if self._recovery_time_ms is None

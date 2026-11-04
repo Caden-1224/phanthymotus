@@ -59,3 +59,29 @@ def vla_config(vla: dict, runtime: dict) -> dict:
     if model:
         result["cloud_model_name"] = model
     return result
+
+
+# The checkpoint settings the card's `smolvla` provider reads. The worker must
+# load the same ones, or "native vs runtime" compares two different models.
+SMOLVLA_SETTINGS = ("model_name", "models", "weights", "model_dir", "feature_map",
+                    "unnorm_key", "vlm_dir", "vlm_weights", "device")
+
+
+def worker_config(runtime: dict, vla: dict) -> dict:
+    """Runtime config with the card's SmolVLA checkpoint settings by default.
+
+    The card config is the one operators already set up and verify. Copying
+    those keys into the worker section removes the second, hand-maintained
+    checkpoint identity — the thing that could silently make the runtime load
+    different weights from the native provider. Anything explicitly set under
+    `runtime.smolvla` still wins, so a deliberate A/B can override it.
+    """
+    result = dict(runtime or {})
+    if str(result.get("backend") or "") != "smolvla":
+        return result
+    settings = dict(result.get("smolvla") or {})
+    for key in SMOLVLA_SETTINGS:
+        if key not in settings and key in (vla or {}):
+            settings[key] = vla[key]
+    result["smolvla"] = settings
+    return result

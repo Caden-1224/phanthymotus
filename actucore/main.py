@@ -378,7 +378,8 @@ def main():
     log.info(f"actucore bundle starting, mcp_port={mcp_port}")
     log.info(f"config: cards enabled={enabled or '(none)'}")
 
-    runtime_cfg = cfg.get("runtime") or {}
+    runtime_cfg = model_runtime.worker_config(cfg.get("runtime") or {},
+                                              plugins_cfg.get("vla") or {})
     if model_runtime.enabled(runtime_cfg):
         _runtime = model_runtime.RuntimeGateway(runtime_cfg)
         _runtime.start()
