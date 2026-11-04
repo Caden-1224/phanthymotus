@@ -43,6 +43,8 @@ from pathlib import Path
 
 import yaml
 
+import runtime as model_runtime
+
 import rclpy
 import rclpy.executors
 
@@ -134,7 +136,12 @@ class ActuCoreBundle:
 
         if plugins_cfg.get("vla", {}).get("enabled", False):
             from plugins.vla import VLAPlugin
-            self._plugins.append(VLAPlugin(plugins_cfg["vla"], executor))
+            # Runtime on: the same card is pointed at the local gateway. Runtime
+            # off: this is byte-for-byte the config the card had before, which is
+            # the rollback path.
+            vla_cfg = model_runtime.vla_config(plugins_cfg.get("vla") or {},
+                                               cfg.get("runtime") or {})
+            self._plugins.append(VLAPlugin(vla_cfg, executor))
             log.info("VLAPlugin loaded")
 
         if plugins_cfg.get("navi", {}).get("enabled", False):
@@ -184,6 +191,7 @@ class ActuCoreBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: ActuCoreBundle | None = None
+_runtime: model_runtime.RuntimeGateway | None = None
 
 
 def make_handler():
@@ -360,7 +368,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
 
 
 def main():
-    global _bundle
+    global _bundle, _runtime
 
     cfg      = _load_config()
     mcp_port = int(cfg.get("mcp_port", 15730))
@@ -369,6 +377,14 @@ def main():
     enabled = [k for k, v in plugins_cfg.items() if isinstance(v, dict) and v.get("enabled")]
     log.info(f"actucore bundle starting, mcp_port={mcp_port}")
     log.info(f"config: cards enabled={enabled or '(none)'}")
+
+    runtime_cfg = cfg.get("runtime") or {}
+    if model_runtime.enabled(runtime_cfg):
+        _runtime = model_runtime.RuntimeGateway(runtime_cfg)
+        _runtime.start()
+        log.info("model runtime enabled → %s", _runtime.url)
+    else:
+        log.info("model runtime disabled; cards use their configured providers")
 
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")
@@ -398,6 +414,13 @@ def main():
     try:
         server.serve_forever()
     finally:
+        # The model workers are ordinary spawned children, so they go first:
+        # one that is wedged must not delay the ROS shutdown path below.
+        if _runtime is not None:
+            try:
+                _runtime.stop()
+            except Exception:       # noqa: BLE001 — shutdown is best effort
+                log.exception("model runtime shutdown failed")
         # 关机顺序是有讲究的：spin 线程还停在 `executor.spin()` 里面（rclpy 的 C++
         # 代码里）时，解释器一旦开始 finalize，就会 `terminate called without an
         # active exception` → `Fatal Python error: Aborted`，容器退出码 134。

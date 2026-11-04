@@ -65,6 +65,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
+COPY actucore/runtime/    /work/runtime/
 COPY actucore/config.yaml /work/config.yaml
 # Atomic-write stdout guard. The build context is the repo root, so this reuses
 # perception's copy instead of adding a fourth one to keep in sync — see the

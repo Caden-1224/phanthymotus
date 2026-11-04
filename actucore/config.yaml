@@ -5,6 +5,35 @@
 
 mcp_port: 15730
 
+# ── model runtime ────────────────────────────────────────────────────────────
+# 开启后 ActuCore 起一个 motus.vla/1 gateway，并把 `vla` 卡片自动指向它
+# （provider 改写为 vla_cloud，endpoint 指向本机 loopback）。关闭后卡片完全
+# 按 plugins.vla 里的原配置运行 —— 回滚只改这一个值，不换镜像、不改卡片。
+#
+# 当前只有 mock/delay worker；真实 SmolVLA worker 在下一阶段接进来。
+runtime:
+  enabled: false
+  host: 127.0.0.1
+  port: 15732
+  # mock = 正弦轨迹；delay = 同一轨迹加固定延迟，验证 inference 期间
+  # /healthz、/status 仍然快速响应。
+  backend: mock
+  delay_ms: 0
+  infer_timeout_ms: 5000
+  # /capabilities 的模型身份。action_dim / control_mode / control_hz /
+  # chunk_size 必须与卡片下游的动作空间一致；对不上会在启动协商处被拒绝，
+  # 不会跑起来后一条条失败。mock 不读观测，也不受 image_size 影响。
+  capabilities:
+    model: mock-sine@8s
+    control_mode: joint_position
+    action_dim: 7
+    chunk_size: 10
+    control_hz: 30
+    needs_state: false
+    n_cameras: 0
+    image_size: 0
+    supports_rtc: false
+
 plugins:
   vla:
     # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。
