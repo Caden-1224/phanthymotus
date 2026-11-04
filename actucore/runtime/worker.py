@@ -54,7 +54,7 @@ def worker_main(connection, backend_name: str, config: dict) -> None:
                     connection.send(("result", request_id, actions))
             elif message[0] == "close":
                 break
-    except EOFError:
+    except (EOFError, ConnectionResetError):
         pass
     finally:
         backend.close()

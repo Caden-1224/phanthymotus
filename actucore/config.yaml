@@ -20,6 +20,10 @@ runtime:
   backend: mock
   delay_ms: 0
   infer_timeout_ms: 5000
+  # Worker 崩溃后每 100ms 检测一次；空闲超过 idle_reap_ms 后回收进程
+  # （0 = 不回收）。下次 infer 会重新拉起 worker。
+  monitor_interval_ms: 100
+  idle_reap_ms: 60000
   # /capabilities 的模型身份。action_dim / control_mode / control_hz /
   # chunk_size 必须与卡片下游的动作空间一致；对不上会在启动协商处被拒绝，
   # 不会跑起来后一条条失败。mock 不读观测，也不受 image_size 影响。

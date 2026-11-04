@@ -21,6 +21,7 @@ class SessionState(str, Enum):
     READY = "ready"
     BUSY = "busy"
     CANCELLING = "cancelling"
+    RECOVERING = "recovering"
     TERMINATED = "terminated"
 
 
@@ -60,13 +61,31 @@ class Session:
 
     def finish_infer(self, error: str = "") -> None:
         with self._lock:
+            if self._in_flight:
+                self._inference_count += 1
             self._in_flight = False
-            self._inference_count += 1
             if error:
                 self._last_error = error
             if self._closed:
                 self._state = SessionState.TERMINATED
             elif self._state in (SessionState.BUSY, SessionState.CANCELLING):
+                self._state = SessionState.READY
+
+    def mark_recovering(self, error: str) -> None:
+        """The worker is gone; hold the session until a replacement is ready."""
+        with self._lock:
+            if self._in_flight:
+                self._inference_count += 1
+            self._in_flight = False
+            self._last_error = error
+            if self._closed:
+                self._state = SessionState.TERMINATED
+            else:
+                self._state = SessionState.RECOVERING
+
+    def mark_ready(self) -> None:
+        with self._lock:
+            if self._state is SessionState.RECOVERING:
                 self._state = SessionState.READY
 
     def cancel(self) -> None:
@@ -91,6 +110,16 @@ class Session:
     @property
     def cancelled(self) -> bool:
         return self._cancel.is_set()
+
+    @property
+    def in_flight(self) -> bool:
+        with self._lock:
+            return self._in_flight
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -132,7 +161,7 @@ class SessionRegistry:
             session.close()
         return session
 
-    def close_all(self) -> list:
+    def close_all(self) -> list[str]:
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:
@@ -143,3 +172,11 @@ class SessionRegistry:
         with self._lock:
             sessions = list(self._sessions.values())
         return [session.snapshot() for session in sessions]
+
+    def mark_all_recovering(self, error: str) -> None:
+        for session in list(self._sessions.values()):
+            session.mark_recovering(error)
+
+    def mark_all_ready(self) -> None:
+        for session in list(self._sessions.values()):
+            session.mark_ready()

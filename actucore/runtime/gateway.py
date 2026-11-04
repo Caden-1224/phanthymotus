@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 from . import config as runtime_config
 from .session import BusyError, ClosedError, SessionRegistry
-from .supervisor import WorkerError, WorkerSupervisor, WorkerTimeout
+from .supervisor import BackendError, WorkerError, WorkerSupervisor, WorkerTimeout
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,11 @@ class RuntimeGateway:
             backend=str(self._config.get("backend") or "mock"),
             config=worker_config,
             timeout_ms=float(self._config.get("infer_timeout_ms", 5000)),
+            idle_reap_ms=float(self._config.get(
+                "idle_reap_ms", self._config.get("idle_timeout_ms", 60000))),
+            monitor_interval_ms=float(self._config.get("monitor_interval_ms", 100)),
+            on_recovering=self._sessions.mark_all_recovering,
+            on_ready=self._sessions.mark_all_ready,
         )
         self._server = None
         self._thread = None
@@ -122,11 +127,20 @@ class RuntimeGateway:
         try:
             actions = self._worker.request(body)
         except WorkerTimeout as error:
-            session.finish_infer(str(error))
+            if session.closed:
+                session.finish_infer(str(error))
+                return 409, _error("cancelled", "the session was closed", session_id=session_id)
+            session.mark_recovering(str(error))
             return 504, _error("timeout", str(error), session_id=session_id)
-        except WorkerError as error:
+        except BackendError as error:
             session.finish_infer(str(error))
-            return 503, _error("worker_unavailable", str(error), session_id=session_id)
+            return 502, _error("model_error", str(error), session_id=session_id)
+        except WorkerError as error:
+            if session.closed:
+                session.finish_infer(str(error))
+                return 409, _error("cancelled", "the session was closed", session_id=session_id)
+            session.mark_recovering(str(error))
+            return 503, _error("recovering", str(error), session_id=session_id)
 
         if session.cancelled:
             session.finish_infer()
@@ -147,11 +161,14 @@ class RuntimeGateway:
             if session is None:
                 return 404, _error("not_found", f"no session {session_id!r}",
                                    session_id=session_id)
-            return 200, {"schema": runtime_config.SCHEMA,
-                         "closed": session_id,
-                         "state": session.snapshot()["state"]}
-        closed = self._sessions.close_all()
-        return 200, {"schema": runtime_config.SCHEMA, "closed": closed}
+            result = {"schema": runtime_config.SCHEMA,
+                      "closed": session_id,
+                      "state": session.snapshot()["state"]}
+        else:
+            closed = self._sessions.close_all()
+            result = {"schema": runtime_config.SCHEMA, "closed": closed}
+        self._worker.reap()
+        return 200, result
 
     def cancel(self, body: dict) -> tuple[int, dict]:
         session_id = str(body.get("session_id") or "")
@@ -160,6 +177,11 @@ class RuntimeGateway:
             return 404, _error("not_found", f"no session {session_id!r}",
                                session_id=session_id)
         session.cancel()
+        if bool(body.get("hard")) and session.in_flight:
+            self._worker.kill("hard cancel requested")
+            session.mark_recovering("hard cancel requested")
+            return 202, {"schema": runtime_config.SCHEMA,
+                         "cancelled": session_id, "state": "recovering"}
         return 200, {"schema": runtime_config.SCHEMA,
                      "cancelled": session_id,
                      "state": session.snapshot()["state"]}

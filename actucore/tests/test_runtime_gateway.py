@@ -223,6 +223,11 @@ def test_cancel_does_not_deliver_the_old_chunk():
         assert status == 409
         assert body["error"]["code"] == "cancelled"
         assert "actions" not in body
+
+        # Close is terminal for this worker: the in-flight error must not be
+        # mistaken for a crash and restarted.
+        assert wait_for_worker(gateway, "stopped", timeout=3)
+        assert gateway.worker.pid is None
     finally:
         gateway.stop()
 
@@ -238,26 +243,22 @@ def test_the_worker_is_spawned_not_forked():
         gateway.stop()
 
 
-def test_killing_the_worker_leaves_the_gateway_alive():
+def test_killing_the_worker_leaves_the_gateway_and_card_alive():
     gateway = make_gateway()
     try:
         pid = gateway.worker.pid
         assert pid and gateway.worker.status()["state"] == "ready"
 
         os.kill(pid, signal.SIGKILL)
-        assert wait_for(lambda: gateway.worker.status()["state"] == "dead")
-
-        status, body = _request(gateway.url + "/healthz")
-        assert status == 503 and body["status"] == "unavailable"
+        assert wait_for_worker(gateway, "ready", restart_count=1)
+        assert gateway.worker.pid != pid
 
         status, body = _request(gateway.url + "/status")
         assert status == 200
-        assert body["worker"]["state"] == "dead"
-        assert body["worker"]["restart_count"] == 0
-        assert gateway.worker.pid == pid          # no automatic restart
+        assert body["worker"]["state"] == "ready"
 
-        # The card is a plain object in this process; a dead worker must make
-        # it hold (health false) rather than raise or take the process down.
+        # The card is a plain object in this process; during recovery it holds
+        # (health false) rather than raising or taking the process down.
         from plugins.vla import VLAPlugin
         card = VLAPlugin({"provider": "vla_cloud", "endpoint": gateway.url},
                          executor=None)
@@ -271,9 +272,9 @@ def test_killing_the_worker_leaves_the_gateway_alive():
                 self.published += 1
 
         card._publisher = _Publisher()
-        assert card._state() == "loading"
-        card._tick()                          # no exception, publishes nothing
-        assert card._publisher.published == 0
+        assert card._state() == "running"
+        card._tick()
+        assert card._publisher.published == 1
     finally:
         gateway.stop()
 
@@ -354,5 +355,184 @@ def test_cancel_keeps_the_session_usable():
                         == "ready")
         status, body = _request(gateway.url + "/infer", infer_payload("s1", seq=2))
         assert status == 200 and body["actions"]
+    finally:
+        gateway.stop()
+
+
+# ── worker crash detection, restart and recovery ────────────────────────────
+
+def wait_for_worker(gateway, state, restart_count=None, timeout=5.0):
+    def ready():
+        worker = _request(gateway.url + "/status")[1]["worker"]
+        return (worker["state"] == state
+                and (restart_count is None or worker["restart_count"] == restart_count))
+    return wait_for(ready, timeout=timeout)
+
+
+def test_killed_worker_is_restarted_and_reports_recovery():
+    gateway = make_gateway()
+    try:
+        provider = VLACloudProvider({}, {"endpoint": gateway.url})
+        provider.infer(observation())
+
+        pid = gateway.worker.pid
+        os.kill(pid, signal.SIGKILL)
+
+        # The monitor must publish recovering before the replacement is ready,
+        # otherwise an operator sees a dead worker as healthy for one poll.
+        seen = set()
+
+        def restarted():
+            worker = _request(gateway.url + "/status")[1]["worker"]
+            seen.add(worker["state"])
+            return worker["state"] == "ready" and worker["restart_count"] == 1
+
+        assert wait_for(restarted, timeout=5)
+        assert "recovering" in seen
+
+        worker = _request(gateway.url + "/status")[1]["worker"]
+        assert worker["pid"] != pid
+        assert worker["restart_count"] == 1
+        assert worker["last_error"]
+        assert worker["recovery_time_ms"] is not None
+        assert provider.infer(observation())          # the next infer succeeds
+    finally:
+        gateway.stop()
+
+
+def test_kill_restart_is_repeatable_five_times():
+    gateway = make_gateway()
+    try:
+        provider = VLACloudProvider({}, {"endpoint": gateway.url})
+        provider.infer(observation())
+
+        for count in range(1, 6):
+            pid = gateway.worker.pid
+            os.kill(pid, signal.SIGKILL)
+            states = set()
+
+            def restarted(count=count, states=states):
+                worker = _request(gateway.url + "/status")[1]["worker"]
+                states.add(worker["state"])
+                return worker["state"] == "ready" and worker["restart_count"] == count
+
+            assert wait_for(restarted), f"restart {count}/5 did not become ready"
+            assert "recovering" in states, f"restart {count}/5 skipped recovering"
+            assert gateway.worker.pid != pid
+            assert provider.infer(observation())
+    finally:
+        gateway.stop()
+
+
+def test_hard_cancel_kills_a_stuck_worker_and_recovers_the_session():
+    gateway = make_gateway(backend="delay", delay_ms=800)
+    try:
+        reply = {}
+
+        def run_infer():
+            reply["value"] = _request(gateway.url + "/infer", infer_payload("s1"))
+
+        thread = threading.Thread(target=run_infer)
+        thread.start()
+        assert wait_for(lambda: any(s["in_flight"] for s in
+                                    _request(gateway.url + "/status")[1]["sessions"]))
+        old_pid = gateway.worker.pid
+
+        status, body = _request(gateway.url + "/cancel",
+                                {"session_id": "s1", "hard": True})
+        assert status in (200, 202)
+        assert body["state"] == "recovering"
+
+        thread.join(timeout=5)
+        assert reply["value"][0] in (409, 503)
+
+        assert wait_for_worker(gateway, "ready", restart_count=1)
+        assert gateway.worker.pid != old_pid
+
+        status, body = _request(gateway.url + "/status")
+        assert body["sessions"][0]["state"] in ("ready", "recovering")
+        # The same session is usable again, not stuck in cancelling.
+        status, body = _request(gateway.url + "/infer", infer_payload("s1", seq=2))
+        assert status == 200 and body["actions"]
+    finally:
+        gateway.stop()
+
+
+def test_a_stuck_inference_times_out_and_restarts_the_worker():
+    gateway = make_gateway(backend="delay", delay_ms=1000, infer_timeout_ms=100)
+    try:
+        old_pid = gateway.worker.pid
+        status, body = _request(gateway.url + "/infer", infer_payload("s1"))
+
+        assert status == 504
+        assert body["error"]["code"] == "timeout"
+
+        assert wait_for_worker(gateway, "ready", restart_count=1)
+        assert gateway.worker.pid != old_pid
+        assert _request(gateway.url + "/status")[1]["worker"]["last_error"]
+    finally:
+        gateway.stop()
+
+
+def test_idle_worker_is_reaped_and_wakes_on_next_infer():
+    gateway = make_gateway(idle_reap_ms=100)
+    try:
+        provider = VLACloudProvider({}, {"endpoint": gateway.url})
+        provider.infer(observation())
+        old_pid = gateway.worker.pid
+
+        assert wait_for_worker(gateway, "stopped", timeout=5)
+        assert gateway.worker.pid is None
+
+        actions = provider.infer(observation())
+        assert actions and gateway.worker.pid != old_pid
+    finally:
+        gateway.stop()
+
+
+def test_idle_reap_does_not_kill_an_in_flight_inference():
+    gateway = make_gateway(backend="delay", delay_ms=400, idle_reap_ms=100)
+    try:
+        reply = {}
+
+        def run_infer():
+            reply["value"] = _request(gateway.url + "/infer", infer_payload("s1"))
+
+        thread = threading.Thread(target=run_infer)
+        thread.start()
+        time.sleep(0.2)                       # well past the idle timer
+        assert gateway.worker.pid is not None
+        thread.join(timeout=5)
+        assert reply["value"][0] == 200
+        assert wait_for_worker(gateway, "stopped", timeout=5)
+    finally:
+        gateway.stop()
+
+
+def test_close_stops_the_worker_process():
+    gateway = make_gateway()
+    try:
+        pid = gateway.worker.pid
+        status, body = _request(gateway.url + "/close", {})
+        assert status == 200
+        assert body["closed"] == []
+
+        assert wait_for_worker(gateway, "stopped")
+        assert gateway.worker.pid is None
+        assert pid is not None
+
+        def process_exists():
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+
+        assert wait_for(lambda: not process_exists(), timeout=5)
+
+        # Reaped, not permanently shut down: the next session wakes a worker.
+        status, body = _request(gateway.url + "/infer", infer_payload("after-close"))
+        assert status == 200 and body["actions"]
+        assert gateway.worker.pid is not None
     finally:
         gateway.stop()
