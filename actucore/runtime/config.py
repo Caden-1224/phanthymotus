@@ -34,17 +34,40 @@ def capabilities(config: dict) -> dict:
     return merged
 
 
-def host(config: dict) -> str:
+def client_host(config: dict) -> str:
+    """The address the card should use to reach this gateway."""
     value = str((config or {}).get("host") or "127.0.0.1")
     return "127.0.0.1" if value in ("", "0.0.0.0") else value
 
 
+def bind_host(config: dict) -> str:
+    """The address the gateway binds. A test server may deliberately bind all
+    interfaces; the local gateway's default stays loopback."""
+    return str((config or {}).get("host") or "127.0.0.1")
+
+
 def port(config: dict) -> int:
-    return int((config or {}).get("port") or DEFAULT_PORT)
+    value = (config or {}).get("port")
+    return DEFAULT_PORT if value in (None, "") else int(value)
 
 
 def base_url(config: dict) -> str:
-    return f"http://{host(config)}:{port(config)}"
+    return f"http://{client_host(config)}:{port(config)}"
+
+
+def remote(config: dict) -> dict:
+    """The remote execution target, or {} when none is configured."""
+    value = dict((config or {}).get("remote") or {})
+    endpoint = str(value.get("endpoint") or "").strip()
+    if not endpoint:
+        return {}
+    backend = str(value.get("backend") or "remote_http").strip()
+    if backend != "remote_http":
+        raise ValueError(
+            f"runtime.remote.backend must be 'remote_http', not {backend!r}")
+    value["endpoint"] = endpoint
+    value["backend"] = backend
+    return value
 
 
 def vla_config(vla: dict, runtime: dict) -> dict:

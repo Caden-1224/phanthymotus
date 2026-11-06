@@ -94,6 +94,20 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 
 端口只有一个：ActuCore 没有 Perception 那种音频流场景，所以不开 WebSocket（15731 预留）。
 
+## 模型 runtime：远端测试 server
+
+远端 execution target 的另一端是同一个 `motus.vla/1` gateway。`tools/remote_vla_server.py`
+在笔记本 RTX 4060 上加载与机器人相同的 checkpoint 配置，暴露 `/capabilities`、`/infer`、
+`/healthz`、`/status`、`/close`：
+
+```bash
+python3 actucore/tools/remote_vla_server.py --config actucore/config.yaml \
+    --host 0.0.0.0 --port 15732
+```
+
+机器人侧把 `runtime.remote.endpoint` 指向它；`max_obs_age_ms` / `watchdog_ms`
+要和 driver descriptor 一致。它是测试/溢出 target，不是生产 serving。
+
 ## `navi` 卡片
 
 看到目标就朝它走过去。接 `vop` 的检测结果和一路深度图，输出 `motus.control/1`

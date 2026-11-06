@@ -58,6 +58,32 @@ runtime:
   #         cam0: observation.images.camera1
   #         state: observation.state
 
+  # ── remote execution target（测试/溢出，非生产）─────────────────────────
+  # 显式把 session 放到另一台机器的 `motus.vla/1` server（例如笔记本 RTX
+  # 4060，见 tools/remote_vla_server.py）。`/infer` 请求带
+  # `"target": "remote"` 即把该 session 钉在远端；同一 session 后续 chunk
+  # 不会切回 local，也不会 per-chunk 切 target。已存在的 session 永远粘住
+  # 首次的 target。
+  #
+  # remote target 的 /capabilities 必须与本机 worker 的 schema / model /
+  # action_dim / control_mode / chunk_size / control_hz 完全一致，否则该
+  # session 被拒绝（remote_capabilities_mismatch），不会静默降级。
+  #
+  # RTT / p95 记录在 gateway 的 /status.remote.latency。p95 超过 driver
+  # descriptor 的 max_obs_age_ms 或 watchdog_ms 时 control_suitable=false，
+  # 该 target 只可用于离线或非控制验证。下面两个预算值必须和 driver
+  # descriptor 保持一致。
+  #
+  # remote:
+  #   backend: remote_http
+  #   endpoint: http://192.168.1.20:15732
+  #   api_key: ""
+  #   timeout_ms: 2000
+  #   # 必须和 driver descriptor 的两个值一致；不填则 /status 不给出
+  #   # control_suitable 结论（不会用猜测的默认值冒充通过）。
+  #   max_obs_age_ms: 300
+  #   watchdog_ms: 200
+
 plugins:
   vla:
     # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。

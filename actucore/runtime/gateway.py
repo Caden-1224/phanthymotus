@@ -15,7 +15,9 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlsplit
 
 from . import config as runtime_config
-from .session import BusyError, ClosedError, SessionRegistry
+from .remote import RemoteError, RemoteHTTPBackend
+from .session import (BusyError, ClosedError, LOCAL_TARGET, REMOTE_TARGET,
+                      SessionRegistry, TARGETS)
 from .supervisor import (BackendError, WorkerError, WorkerLoading,
                          WorkerSupervisor, WorkerTimeout)
 
@@ -48,6 +50,9 @@ class RuntimeGateway:
             on_recovering=self._sessions.mark_all_recovering,
             on_ready=self._sessions.mark_all_ready,
         )
+        remote_config = runtime_config.remote(self._config)
+        self._remote = (RemoteHTTPBackend(remote_config, self.capabilities)
+                        if remote_config else None)
         self._server = None
         self._thread = None
 
@@ -57,7 +62,8 @@ class RuntimeGateway:
         self._worker.start()
         try:
             self._server = _ThreadingHTTPServer(
-                (runtime_config.host(self._config), runtime_config.port(self._config)),
+                (runtime_config.bind_host(self._config),
+                 runtime_config.port(self._config)),
                 _make_handler(self),
             )
         except Exception:
@@ -78,6 +84,8 @@ class RuntimeGateway:
         if thread is not None:
             thread.join(timeout=5)
         self._sessions.close_all()
+        if self._remote is not None:
+            self._remote.close()
         self._worker.stop()
 
     @property
@@ -85,6 +93,10 @@ class RuntimeGateway:
         if self._server is None:
             return runtime_config.base_url(self._config)
         host, port = self._server.server_address[:2]
+        # A server bound to every interface is reached through loopback
+        # locally; printing 0.0.0.0 as a client URL would be a dead address.
+        if host in ("", "0.0.0.0", "::"):
+            host = "127.0.0.1"
         return f"http://{host}:{port}"
 
     @property
@@ -123,9 +135,12 @@ class RuntimeGateway:
                      "status": "unavailable", "worker": state, "healthy": False}
 
     def status(self) -> dict:
-        return {"schema": runtime_config.SCHEMA,
-                "worker": self._worker.status(),
-                "sessions": self._sessions.snapshot()}
+        result = {"schema": runtime_config.SCHEMA,
+                  "worker": self._worker.status(),
+                  "sessions": self._sessions.snapshot()}
+        if self._remote is not None:
+            result["remote"] = self._remote.status()
+        return result
 
     def infer(self, body: dict) -> tuple[int, dict]:
         if body.get("schema") != runtime_config.SCHEMA:
@@ -136,15 +151,52 @@ class RuntimeGateway:
         if not session_id:
             return 400, _error("missing_session", "infer needs a session_id")
 
-        worker_state = self._worker.state
-        if worker_state == "recovering":
-            return 503, _error("recovering", "the model worker is recovering",
-                               session_id=session_id)
-        if worker_state == "ready" and not self._worker.healthy:
-            return 503, _error("loading", "model weights are still loading",
-                               session_id=session_id)
+        requested = body.get("target")
+        if requested is not None and requested not in TARGETS:
+            return 400, _error(
+                "bad_target",
+                f"target must be one of {TARGETS}, not {requested!r}",
+                session_id=session_id)
 
-        session = self._sessions.get_or_create(session_id)
+        session = self._sessions.get(session_id)
+        created = session is None
+        if created:
+            target = str(requested or LOCAL_TARGET)
+            if target == REMOTE_TARGET and self._remote is None:
+                return 400, _error(
+                    "remote_not_configured",
+                    "this gateway has no `runtime.remote.endpoint`; a session "
+                    "cannot be placed on a remote target",
+                    session_id=session_id)
+            session = self._sessions.get_or_create(session_id, target)
+        if requested and requested != session.target:
+            # A session is pinned to one machine for its whole life. Mixing
+            # chunks from two targets is not a retry, it is a different policy.
+            return 409, _error(
+                "target_conflict",
+                f"session {session_id!r} is pinned to {session.target!r}, "
+                f"request asks for {requested!r}", session_id=session_id)
+
+        if session.target == LOCAL_TARGET:
+            worker_state = self._worker.state
+            if worker_state == "recovering":
+                return 503, _error(
+                    "recovering", "the model worker is recovering",
+                    session_id=session_id)
+            if worker_state == "ready" and not self._worker.healthy:
+                return 503, _error(
+                    "loading", "model weights are still loading",
+                    session_id=session_id)
+
+        if created and session.target == REMOTE_TARGET:
+            # A new session revalidates the remote identity: the laptop server
+            # may have restarted with different weights since the last one.
+            try:
+                self._remote.capabilities(refresh=True)
+            except RemoteError as error:
+                return error.status, _error(
+                    error.code, str(error), session_id=session_id)
+
         try:
             session.begin_infer()
         except BusyError as error:
@@ -153,7 +205,17 @@ class RuntimeGateway:
             return 409, _error("closed", str(error), session_id=session_id)
 
         try:
-            actions = self._worker.request(body)
+            if session.target == REMOTE_TARGET:
+                actions = self._remote.infer(body, session_id)
+            else:
+                actions = self._worker.request(body)
+        except RemoteError as error:
+            session.finish_infer(str(error))
+            if session.closed:
+                return 409, _error("cancelled", "the session was closed",
+                                   session_id=session_id)
+            return error.status, _error(
+                error.code, str(error), session_id=session_id)
         except WorkerTimeout as error:
             if session.closed:
                 session.finish_infer(str(error))
@@ -178,8 +240,10 @@ class RuntimeGateway:
             return 409, _error("cancelled", "the session was cancelled", session_id=session_id)
         if not isinstance(actions, list) or not actions:
             session.finish_infer("empty action chunk")
-            return 502, _error("empty_chunk", "the model worker returned no actions",
-                               session_id=session_id)
+            return 502, _error(
+                "empty_chunk",
+                "the execution target returned no actions",
+                session_id=session_id)
 
         session.finish_infer()
         return 200, {"schema": runtime_config.SCHEMA,
@@ -192,11 +256,20 @@ class RuntimeGateway:
             if session is None:
                 return 404, _error("not_found", f"no session {session_id!r}",
                                    session_id=session_id)
+            if session.target == REMOTE_TARGET and self._remote is not None:
+                try:
+                    self._remote.close_session(session_id)
+                except RemoteError:
+                    # The local session is already closed; a remote server that
+                    # is gone has nothing left to clean up that matters.
+                    pass
             result = {"schema": runtime_config.SCHEMA,
                       "closed": session_id,
                       "state": session.snapshot()["state"]}
         else:
             closed = self._sessions.close_all()
+            if self._remote is not None:
+                self._remote.close()
             result = {"schema": runtime_config.SCHEMA, "closed": closed}
         self._worker.reap()
         return 200, result
@@ -209,6 +282,12 @@ class RuntimeGateway:
                                session_id=session_id)
         session.cancel()
         if bool(body.get("hard")) and session.in_flight:
+            if session.target == REMOTE_TARGET:
+                # There is no local process to kill, and a remote forward
+                # cannot be preempted. The reply is discarded when it arrives,
+                # which is the same contract as a soft cancel.
+                return 202, {"schema": runtime_config.SCHEMA,
+                             "cancelled": session_id, "state": "cancelling"}
             self._worker.kill("hard cancel requested")
             session.mark_recovering("hard cancel requested")
             return 202, {"schema": runtime_config.SCHEMA,

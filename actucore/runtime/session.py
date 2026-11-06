@@ -15,6 +15,10 @@ from __future__ import annotations
 import threading
 from enum import Enum
 
+LOCAL_TARGET = "local"
+REMOTE_TARGET = "remote"
+TARGETS = (LOCAL_TARGET, REMOTE_TARGET)
+
 
 class SessionState(str, Enum):
     NEW = "new"
@@ -34,8 +38,12 @@ class ClosedError(RuntimeError):
 
 
 class Session:
-    def __init__(self, session_id: str, target: str = "local"):
+    def __init__(self, session_id: str, target: str = LOCAL_TARGET):
         self.session_id = session_id
+        # A session is pinned to its target for its whole life: switching
+        # between machines mid-session would mix action chunks computed from
+        # different models and clocks. Placement (#8) may choose remote for a
+        # new session, never per chunk.
         self.target = target
         self._lock = threading.Lock()
         self._cancel = threading.Event()
@@ -127,7 +135,9 @@ class Session:
                 "session_id": self.session_id,
                 "state": self._state.value,
                 "target": self.target,
-                "placement_reason": "local-first",
+                "placement_reason": ("local-first"
+                                     if self.target == LOCAL_TARGET
+                                     else "explicit"),
                 "in_flight": self._in_flight,
                 "queue_depth": 0,
                 "inference_count": self._inference_count,
@@ -142,11 +152,12 @@ class SessionRegistry:
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
 
-    def get_or_create(self, session_id: str) -> Session:
+    def get_or_create(self, session_id: str,
+                      target: str = LOCAL_TARGET) -> Session:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
-                session = Session(session_id)
+                session = Session(session_id, target)
                 self._sessions[session_id] = session
             return session
 
