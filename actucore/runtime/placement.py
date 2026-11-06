@@ -1,8 +1,9 @@
 """Local-first placement for new sessions.
 
-The policy is consulted exactly once, when a session is created. After that the
-session owns its target for life: this module is never asked where a later
-chunk should run, which is what makes per-chunk switching impossible.
+The policy is consulted when a session is created. After that the session owns
+its target; the only later move is a gateway-recorded local→remote failover
+after a local health failure, which is evaluated once at a chunk boundary and
+never per chunk.
 
 A new session stays local unless the local worker is unavailable, the local
 queue is already over the configured depth, or the local EWMA p95 is over the
@@ -94,6 +95,12 @@ class PlacementPolicy:
         # The first later clean decision is the recovery evidence operators
         # need to see; all subsequent ones are ordinary local-first decisions.
         self._degraded = False
+        # Switch accounting: one failover per session at most; a failback is
+        # the first new session placed back on local after a degraded period.
+        self._failover_count = 0
+        self._failback_count = 0
+        self._switches = collections.deque(
+            maxlen=max(1, int(config["decision_log_size"])))
         self._lock = threading.Lock()
 
     def record_latency(self, elapsed_ms: float) -> None:
@@ -101,6 +108,34 @@ class PlacementPolicy:
 
     def reset_latency(self) -> None:
         self.latency.reset()
+
+    def record_failover(self, session_id: str, reason: str,
+                        degraded: bool = True) -> None:
+        """Count a session's one permitted local→remote move and its reason.
+
+        `degraded` is false when only one chunk failed while the worker stayed
+        healthy: there is no local recovery for a later new session to
+        fail back from, so the failback counter must not move.
+        """
+        with self._lock:
+            self._failover_count += 1
+            if degraded:
+                self._degraded = True
+            self._record_switch_locked(
+                session_id, "failover", REMOTE_TARGET, reason)
+
+    def _record_switch_locked(self, session_id: str, kind: str,
+                              to_target: str, reason: str) -> None:
+        """Append one switch event; caller holds `self._lock`."""
+        from_target = REMOTE_TARGET if to_target == LOCAL_TARGET else LOCAL_TARGET
+        self._switches.append({
+            "session_id": session_id,
+            "kind": kind,
+            "placement_decision": to_target,
+            "from": from_target,
+            "to": to_target,
+            "reason": reason,
+        })
 
     def decide(self, session_id: str, local_healthy: bool,
                local_available: bool, queue_depth: int, remote,
@@ -127,7 +162,13 @@ class PlacementPolicy:
 
             if not local_issues:
                 with self._lock:
-                    reason = "local_recovered" if self._degraded else "local_first"
+                    if self._degraded:
+                        reason = "local_recovered"
+                        self._failback_count += 1
+                        self._record_switch_locked(
+                            session_id, "failback", LOCAL_TARGET, reason)
+                    else:
+                        reason = "local_first"
                     self._degraded = False
                 target = LOCAL_TARGET
             else:
@@ -174,6 +215,9 @@ class PlacementPolicy:
             counts = {LOCAL_TARGET: 0, REMOTE_TARGET: 0}
             for decision in decisions:
                 counts[decision["target"]] += 1
+            failover_count = self._failover_count
+            failback_count = self._failback_count
+            switches = [dict(switch) for switch in self._switches]
         p95 = self.latency.p95_ms
         return {
             "policy": POLICY,
@@ -192,4 +236,8 @@ class PlacementPolicy:
             },
             "counts": counts,
             "decisions": decisions,
+            "failover_count": failover_count,
+            "failback_count": failback_count,
+            "switch_count": failover_count + failback_count,
+            "switches": switches,
         }

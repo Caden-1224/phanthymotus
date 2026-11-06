@@ -19,7 +19,7 @@ from . import config as runtime_config
 from .placement import PlacementPolicy
 from .remote import RemoteError, RemoteHTTPBackend
 from .session import (BusyError, ClosedError, LOCAL_TARGET, REMOTE_TARGET,
-                      SessionRegistry, TARGETS)
+                      Session, SessionRegistry, TARGETS)
 from .supervisor import (BackendError, WorkerError, WorkerLoading,
                          WorkerSupervisor, WorkerTimeout)
 
@@ -58,6 +58,9 @@ class RuntimeGateway:
                         if remote_config else None)
         self._server = None
         self._thread = None
+        # A hard cancel deliberately kills the worker; it is not a local
+        # health failure, so sessions must not use it as a failover trigger.
+        self._failover_suppressed = False
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -110,10 +113,19 @@ class RuntimeGateway:
         # Latency belonged to the dead worker; keeping it would keep placing
         # new sessions on remote long after the replacement is healthy.
         self._placement.reset_latency()
-        # A local worker crash must not touch sessions pinned to remote.
-        self._sessions.mark_all_recovering(error, target=LOCAL_TARGET)
+        # A hard cancel is an operator action, not a health failure: stay
+        # local once the replacement is ready instead of failing sessions over.
+        planned = error == "hard cancel requested"
+        if planned:
+            self._failover_suppressed = True
+        # A local worker crash must not touch sessions pinned to remote. Local
+        # sessions remember the failure so their next chunk can fail over.
+        self._sessions.mark_all_recovering(
+            error, target=LOCAL_TARGET,
+            failover_reason="" if planned else "local_unhealthy")
 
     def _worker_ready(self) -> None:
+        self._failover_suppressed = False
         self._sessions.mark_all_ready(target=LOCAL_TARGET)
 
     def _local_placement_healthy(self) -> bool:
@@ -123,6 +135,50 @@ class RuntimeGateway:
         # An idle-reaped worker is woken by the next request, so "stopped" is
         # availability, not a reason to overflow. Loading or recovering is not.
         return self._worker.healthy or self._worker.state == "stopped"
+
+    def _local_health_reason(self) -> str:
+        """Why the local target cannot take the next chunk, or '' if it can."""
+        if self._local_placement_available():
+            return ""
+        return ("local_loading" if self._worker.state == "ready"
+                else "local_unhealthy")
+
+    def _remote_can_take_over(self) -> bool:
+        if self._remote is None:
+            return False
+        try:
+            if not self._remote.healthy():
+                return False
+        except RemoteError:
+            return False
+        return self._remote.control_suitable() is not False
+
+    def _maybe_failover(self, session: Session) -> None:
+        """Move a local session to remote before its next chunk, at most once.
+
+        Only called between chunks: the failed chunk has already been
+        discarded and its worker request has returned, so no old local result
+        can race the remote one. A dead or incompatible remote leaves the
+        session local — best effort, never a blind switch.
+        """
+        if session.target != LOCAL_TARGET or session.failover_count:
+            return
+        if self._failover_suppressed:
+            return
+        if session.in_flight:
+            # The old chunk still owns the session; moving now would let its
+            # reply arrive after the target changed. Wait for the next gap.
+            return
+        reason = session.failover_reason or self._local_health_reason()
+        if not reason or not self._remote_can_take_over():
+            return
+        if session.failover(reason):
+            self._placement.record_failover(
+                session.session_id, reason,
+                degraded=reason not in ("local_inference_error",
+                                        "local_empty_chunk"))
+            log.warning("[runtime] session %s failed over to remote: %s",
+                        session.session_id, reason)
 
     # ── HTTP surface ─────────────────────────────────────────────────────────
 
@@ -210,6 +266,12 @@ class RuntimeGateway:
                 f"request asks for {requested!r}", session_id=session_id)
 
         if session.target == LOCAL_TARGET:
+            # `target` is a session-placement preference. A local health
+            # failure may move even an explicitly-local session; an explicit
+            # `target: remote` session is already remote and is untouched.
+            self._maybe_failover(session)
+
+        if session.target == LOCAL_TARGET:
             worker_state = self._worker.state
             if worker_state == "recovering":
                 return 503, _error(
@@ -252,18 +314,22 @@ class RuntimeGateway:
             return error.status, _error(
                 error.code, str(error), session_id=session_id)
         except WorkerTimeout as error:
+            session.mark_failover_pending("local_timeout")
             if session.closed:
                 session.finish_infer(str(error))
                 return 409, _error("cancelled", "the session was closed", session_id=session_id)
             session.mark_recovering(str(error))
             return 504, _error("timeout", str(error), session_id=session_id)
         except WorkerLoading as error:
+            session.mark_failover_pending("local_loading")
             session.finish_infer(str(error))
             return 503, _error("loading", str(error), session_id=session_id)
         except BackendError as error:
+            session.mark_failover_pending("local_inference_error")
             session.finish_infer(str(error))
             return 502, _error("model_error", str(error), session_id=session_id)
         except WorkerError as error:
+            session.mark_failover_pending("local_worker_error")
             if session.closed:
                 session.finish_infer(str(error))
                 return 409, _error("cancelled", "the session was closed", session_id=session_id)
@@ -274,6 +340,7 @@ class RuntimeGateway:
             session.finish_infer()
             return 409, _error("cancelled", "the session was cancelled", session_id=session_id)
         if not isinstance(actions, list) or not actions:
+            session.mark_failover_pending("local_empty_chunk")
             session.finish_infer("empty action chunk")
             return 502, _error(
                 "empty_chunk",

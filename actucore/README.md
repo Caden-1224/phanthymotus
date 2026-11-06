@@ -113,8 +113,9 @@ python3 actucore/tools/remote_vla_server.py --config actucore/config.yaml \
 新 session 默认留在 local。只有 local worker 不健康、local 队列深度超过
 `runtime.placement.max_queue_depth`、或 local EWMA p95 超过
 `runtime.placement.max_p95_ms`，并且 remote 可达、`/capabilities` 与本机一致时，
-新 session 才放到 remote。session 创建后 target 固定，后续 chunk 与已有 session
-都不会被 placement 改写；local 恢复只影响之后新建的 session。
+新 session 才放到 remote。session 创建后 target 固定；唯一例外是 local health
+失败时的 mid-session failover：当前 session 的下一块切到 remote，每个 session
+最多一次且不会切回。local 恢复只影响之后新建的 session（failback）。
 
 每个新 session 的决策在 `/status.placement.decisions` 中，字段包括
 `placement_decision`、`target`、`reason`（`local_first` / `local_unhealthy` /
@@ -123,6 +124,9 @@ python3 actucore/tools/remote_vla_server.py --config actucore/config.yaml \
 `queue_depth`、`p95_ms`。`/status.placement.local` 是当前指标，
 `/status.worker.queue_depth` 是 worker 侧队列深度。`p95_ttl_ms` 过后旧
 p95 视为过期，新 session 会重新探测 local，避免 p95 溢出后永远回不去。
+mid-session 切换记录在 `/status.placement.switches`，并汇总为
+`failover_count` / `failback_count` / `switch_count`；`failback_count` 是 local
+恢复后新 session 回到 local 的次数，不包含当前 session 的强制切回。
 
 无 GPU、无网络的 CI 可重复跑 10 个预期 placement 决策：
 
@@ -130,9 +134,16 @@ p95 视为过期，新 session 会重新探测 local，避免 p95 溢出后永�
 python3 actucore/tools/runtime_load.py --json
 ```
 
+以及 5 个 mid-session failover 场景（一个 local worker 崩溃，5 个已有 session
+全部在下一块切到 fake remote）：
+
+```bash
+python3 actucore/tools/runtime_load.py --json --scenario failover
+```
+
 它启动两个 loopback `motus.vla/1` gateway（local 用 `delay`、remote 用 `mock`），
-退出码只在 10/10 决策匹配时为 0。它验证的是 placement 决策，不是真实 RTX 4060
-或真机延迟；真实硬件的验收测试仍由环境变量显式开启。
+退出码只在全部决策/切换匹配时为 0。它验证的是 placement 与 failover 行为，不是
+真实 RTX 4060 或真机延迟；真实硬件的验收测试仍由环境变量显式开启。
 
 ## `navi` 卡片
 

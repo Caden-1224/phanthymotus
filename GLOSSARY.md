@@ -36,6 +36,10 @@ _Avoid_: load balancing (v1 does not balance per chunk)
 An exceptional mid-session switch from the local target to the remote target after the local worker becomes unhealthy.
 _Avoid_: fallback (fallback may mean any target choice)
 
+**Failback**:
+A new session returning to the local target after a degraded period in which local was unavailable or overloaded. Existing failed-over sessions are not moved back.
+_Avoid_: failover (failover moves an existing session; failback affects future sessions)
+
 **Action chunk**:
 The sequence of future actions returned by one model inference; the VLA card paces it out as individual commands.
 _Avoid_: trajectory, plan
