@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlsplit
 
 from . import config as runtime_config
+from .placement import PlacementPolicy
 from .remote import RemoteError, RemoteHTTPBackend
 from .session import (BusyError, ClosedError, LOCAL_TARGET, REMOTE_TARGET,
                       SessionRegistry, TARGETS)
@@ -38,6 +40,7 @@ class RuntimeGateway:
         self._config = dict(config or {})
         self._capabilities = runtime_config.capabilities(self._config)
         self._sessions = SessionRegistry()
+        self._placement = PlacementPolicy(runtime_config.placement(self._config))
         worker_config = dict(self._config)
         worker_config["capabilities"] = self._capabilities
         self._worker = WorkerSupervisor(
@@ -47,8 +50,8 @@ class RuntimeGateway:
             idle_reap_ms=float(self._config.get(
                 "idle_reap_ms", self._config.get("idle_timeout_ms", 60000))),
             monitor_interval_ms=float(self._config.get("monitor_interval_ms", 100)),
-            on_recovering=self._sessions.mark_all_recovering,
-            on_ready=self._sessions.mark_all_ready,
+            on_recovering=self._worker_recovering,
+            on_ready=self._worker_ready,
         )
         remote_config = runtime_config.remote(self._config)
         self._remote = (RemoteHTTPBackend(remote_config, self.capabilities)
@@ -103,6 +106,24 @@ class RuntimeGateway:
     def worker(self) -> WorkerSupervisor:
         return self._worker
 
+    def _worker_recovering(self, error: str) -> None:
+        # Latency belonged to the dead worker; keeping it would keep placing
+        # new sessions on remote long after the replacement is healthy.
+        self._placement.reset_latency()
+        # A local worker crash must not touch sessions pinned to remote.
+        self._sessions.mark_all_recovering(error, target=LOCAL_TARGET)
+
+    def _worker_ready(self) -> None:
+        self._sessions.mark_all_ready(target=LOCAL_TARGET)
+
+    def _local_placement_healthy(self) -> bool:
+        return self._worker.healthy
+
+    def _local_placement_available(self) -> bool:
+        # An idle-reaped worker is woken by the next request, so "stopped" is
+        # availability, not a reason to overflow. Loading or recovering is not.
+        return self._worker.healthy or self._worker.state == "stopped"
+
     # ── HTTP surface ─────────────────────────────────────────────────────────
 
     def capabilities(self) -> dict:
@@ -137,7 +158,11 @@ class RuntimeGateway:
     def status(self) -> dict:
         result = {"schema": runtime_config.SCHEMA,
                   "worker": self._worker.status(),
-                  "sessions": self._sessions.snapshot()}
+                  "sessions": self._sessions.snapshot(),
+                  "placement": self._placement.snapshot(
+                      local_healthy=self._local_placement_healthy(),
+                      local_available=self._local_placement_available(),
+                      queue_depth=self._worker.queue_depth)}
         if self._remote is not None:
             result["remote"] = self._remote.status()
         return result
@@ -161,14 +186,21 @@ class RuntimeGateway:
         session = self._sessions.get(session_id)
         created = session is None
         if created:
-            target = str(requested or LOCAL_TARGET)
-            if target == REMOTE_TARGET and self._remote is None:
+            if requested == REMOTE_TARGET and self._remote is None:
                 return 400, _error(
                     "remote_not_configured",
                     "this gateway has no `runtime.remote.endpoint`; a session "
                     "cannot be placed on a remote target",
                     session_id=session_id)
-            session = self._sessions.get_or_create(session_id, target)
+            decision = self._placement.decide(
+                session_id,
+                local_healthy=self._local_placement_healthy(),
+                local_available=self._local_placement_available(),
+                queue_depth=self._worker.queue_depth,
+                remote=self._remote,
+                requested=requested)
+            target = decision["target"]
+            session = self._sessions.get_or_create(session_id, target, decision)
         if requested and requested != session.target:
             # A session is pinned to one machine for its whole life. Mixing
             # chunks from two targets is not a retry, it is a different policy.
@@ -208,7 +240,10 @@ class RuntimeGateway:
             if session.target == REMOTE_TARGET:
                 actions = self._remote.infer(body, session_id)
             else:
+                local_started = time.monotonic()
                 actions = self._worker.request(body)
+                self._placement.record_latency(
+                    (time.monotonic() - local_started) * 1000.0)
         except RemoteError as error:
             session.finish_infer(str(error))
             if session.closed:

@@ -84,6 +84,28 @@ runtime:
   #   max_obs_age_ms: 300
   #   watchdog_ms: 200
 
+  # ── local-first placement ───────────────────────────────────────────────
+  # 新 session 默认 local。只有 local worker 不健康、local 队列深度超过
+  # max_queue_depth、或 local EWMA p95 超过 max_p95_ms，且 remote 可达、
+  # /capabilities 与本机一致时，新 session 才放 remote。session 一旦创建就
+  # 钉住 target，后续 chunk 和已有 session 都不会被 placement 改目标。
+  # local 恢复后只影响之后新建的 session（reason=local_recovered）。
+  #
+  # 每个新 session 的决策记录在 /status.placement.decisions，字段包括
+  # placement_decision / target / reason / queue_depth / p95_ms。
+  placement:
+    enabled: true
+    # local 上排队或执行中的 inference 数；超过它才溢出。
+    max_queue_depth: 1
+    # 最近 sample_window 次 local inference 的 p95，再按 ewma_alpha 平滑。
+    max_p95_ms: 250
+    sample_window: 50
+    ewma_alpha: 0.3
+    # 超过这么久没有新的 local sample，旧 p95 视为过期，让新 session
+    # 重新探测 local（0 = 不过期）。
+    p95_ttl_ms: 30000
+    decision_log_size: 1000
+
 plugins:
   vla:
     # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。

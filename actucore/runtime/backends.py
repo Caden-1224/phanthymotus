@@ -50,15 +50,24 @@ class MockBackend:
 
 
 class DelayBackend(MockBackend):
-    """Mock trajectory plus a fixed delay, for noticing blocking where it hurts."""
+    """Mock trajectory plus a delay, for noticing blocking where it hurts.
+
+    The delay is fixed per worker unless a synthetic-load request supplies
+    `delay_ms`, which lets one gateway exercise overflow and recovery.
+    """
 
     def __init__(self, capabilities: dict, delay_ms: float = 0, period_s: float = 8.0):
         super().__init__(capabilities, period_s=period_s)
         self._delay_s = max(0.0, float(delay_ms)) / 1000.0
 
     def infer(self, request: dict) -> list:
-        if self._delay_s:
-            time.sleep(self._delay_s)
+        # A synthetic load may vary latency per request so one gateway can
+        # exercise both overflow and recovery without restarting the worker.
+        delay_ms = request.get("delay_ms")
+        delay_s = (self._delay_s if delay_ms is None
+                   else max(0.0, float(delay_ms)) / 1000.0)
+        if delay_s:
+            time.sleep(delay_s)
         return super().infer(request)
 
 

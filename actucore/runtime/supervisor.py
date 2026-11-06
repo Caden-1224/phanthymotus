@@ -52,6 +52,7 @@ class WorkerSupervisor:
 
         self._lock = threading.Lock()          # process/state lifecycle only
         self._request_lock = threading.Lock()  # one in-flight child request
+        self._queue_lock = threading.Lock()    # placement queue-depth counter
         self._ctx = mp.get_context("spawn")
         self._process = None
         self._connection = None
@@ -68,6 +69,7 @@ class WorkerSupervisor:
         self._last_error = ""
         self._last_activity = time.monotonic()
         self._in_flight = False
+        self._outstanding = 0       # requests queued or executing on this worker
         self._reaping = False
         self._stop_event = threading.Event()
         self._closed = False
@@ -176,7 +178,7 @@ class WorkerSupervisor:
         self._last_error = reason
         log.warning("[runtime] model worker recovering (restart #%d): %s",
                     self._restart_count, reason)
-        self._notify(self._on_recovering)
+        self._notify(self._on_recovering, reason)
 
     def _fail_locked(self, reason: str) -> None:
         if self._reaping:
@@ -286,72 +288,78 @@ class WorkerSupervisor:
             process.join(timeout=2)
 
     @staticmethod
-    def _notify(callback) -> None:
+    def _notify(callback, *args) -> None:
         if callback is not None:
             try:
-                callback()
+                callback(*args)
             except Exception:       # noqa: BLE001 — a callback must not kill the worker
                 pass
 
     # ── requests ─────────────────────────────────────────────────────────────
 
     def request(self, payload: dict) -> list:
-        with self._request_lock:
-            with self._lock:
-                if self._closed:
-                    raise WorkerError("the model worker is closed")
-                if self._state in ("stopped", "dead"):
-                    self._reaping = False
-                    try:
-                        self._spawn_locked()
-                    except WorkerError as error:
-                        self._state = "dead"
-                        self._last_error = str(error)
-                        raise
-                    self._state = "ready"
-                    self._last_activity = time.monotonic()
-                    self._ready_notified = self.healthy
-                    self._recovery_started = 0.0
-                if self._state == "recovering":
-                    raise WorkerRecovering("the model worker is recovering")
-                if not self.alive:
-                    self._fail_locked("model worker is not running")
-                    raise WorkerRecovering("the model worker is recovering")
-                if not self.healthy:
-                    raise WorkerLoading("the model worker is still loading")
-                self._next_request_id += 1
-                request_id = self._next_request_id
-                connection = self._connection
-                self._in_flight = True
-
-            try:
-                try:
-                    connection.send(("infer", request_id, payload))
-                    if not connection.poll(self._timeout_s):
-                        raise WorkerTimeout(
-                            f"model worker did not answer within {self._timeout_s:g}s")
-                    kind, reply_id, body = connection.recv()
-                except WorkerTimeout as error:
-                    with self._lock:
-                        self._fail_locked(str(error))
-                    raise
-                except (EOFError, OSError) as error:
-                    with self._lock:
-                        self._fail_locked(f"model worker exited: {error}")
-                    raise WorkerError(f"model worker exited: {error}") from error
-
-                if reply_id != request_id:
-                    with self._lock:
-                        self._fail_locked(
-                            f"worker reply {reply_id} does not match request {request_id}")
-                    raise WorkerError("model worker returned an out-of-order reply")
-                if kind != "result":
-                    raise BackendError(str(body))
-                return body
-            finally:
+        with self._queue_lock:
+            self._outstanding += 1
+        try:
+            with self._request_lock:
                 with self._lock:
-                    self._in_flight = False
-                    self._last_activity = time.monotonic()
+                    if self._closed:
+                        raise WorkerError("the model worker is closed")
+                    if self._state in ("stopped", "dead"):
+                        self._reaping = False
+                        try:
+                            self._spawn_locked()
+                        except WorkerError as error:
+                            self._state = "dead"
+                            self._last_error = str(error)
+                            raise
+                        self._state = "ready"
+                        self._last_activity = time.monotonic()
+                        self._ready_notified = self.healthy
+                        self._recovery_started = 0.0
+                    if self._state == "recovering":
+                        raise WorkerRecovering("the model worker is recovering")
+                    if not self.alive:
+                        self._fail_locked("model worker is not running")
+                        raise WorkerRecovering("the model worker is recovering")
+                    if not self.healthy:
+                        raise WorkerLoading("the model worker is still loading")
+                    self._next_request_id += 1
+                    request_id = self._next_request_id
+                    connection = self._connection
+                    self._in_flight = True
+
+                try:
+                    try:
+                        connection.send(("infer", request_id, payload))
+                        if not connection.poll(self._timeout_s):
+                            raise WorkerTimeout(
+                                f"model worker did not answer within {self._timeout_s:g}s")
+                        kind, reply_id, body = connection.recv()
+                    except WorkerTimeout as error:
+                        with self._lock:
+                            self._fail_locked(str(error))
+                        raise
+                    except (EOFError, OSError) as error:
+                        with self._lock:
+                            self._fail_locked(f"model worker exited: {error}")
+                        raise WorkerError(f"model worker exited: {error}") from error
+
+                    if reply_id != request_id:
+                        with self._lock:
+                            self._fail_locked(
+                                f"worker reply {reply_id} does not match request {request_id}")
+                        raise WorkerError("model worker returned an out-of-order reply")
+                    if kind != "result":
+                        raise BackendError(str(body))
+                    return body
+                finally:
+                    with self._lock:
+                        self._in_flight = False
+                        self._last_activity = time.monotonic()
+        finally:
+            with self._queue_lock:
+                self._outstanding -= 1
 
     @property
     def start_method(self) -> str:
@@ -372,6 +380,12 @@ class WorkerSupervisor:
     @property
     def capabilities(self) -> dict:
         return dict(self._capabilities)
+
+    @property
+    def queue_depth(self) -> int:
+        """Requests queued or executing on this worker, for placement."""
+        with self._queue_lock:
+            return self._outstanding
 
     @property
     def state(self) -> str:
@@ -415,4 +429,5 @@ class WorkerSupervisor:
                                 else round(self._recovery_time_ms / 1000.0, 3)),
             "last_error": self._last_error,
             "in_flight": self._in_flight,
+            "queue_depth": self.queue_depth,
         }

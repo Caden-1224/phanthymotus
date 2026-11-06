@@ -55,6 +55,27 @@ def base_url(config: dict) -> str:
     return f"http://{client_host(config)}:{port(config)}"
 
 
+PLACEMENT_DEFAULTS = {
+    # Local-first is the product default; thresholds only decide when a *new*
+    # session overflows to remote. A session's target never changes after that.
+    "enabled": True,
+    "max_queue_depth": 1,
+    "max_p95_ms": 250.0,
+    "sample_window": 50,
+    "ewma_alpha": 0.3,
+    # A p95 older than this is treated as unknown so a recovered local worker
+    # gets a new session instead of being pinned behind an old overload.
+    "p95_ttl_ms": 30000.0,
+    "decision_log_size": 1000,
+}
+
+
+def placement(config: dict) -> dict:
+    merged = dict(PLACEMENT_DEFAULTS)
+    merged.update(dict((config or {}).get("placement") or {}))
+    return merged
+
+
 def remote(config: dict) -> dict:
     """The remote execution target, or {} when none is configured."""
     value = dict((config or {}).get("remote") or {})

@@ -108,6 +108,32 @@ python3 actucore/tools/remote_vla_server.py --config actucore/config.yaml \
 机器人侧把 `runtime.remote.endpoint` 指向它；`max_obs_age_ms` / `watchdog_ms`
 要和 driver descriptor 一致。它是测试/溢出 target，不是生产 serving。
 
+### local-first placement 与合成负载
+
+新 session 默认留在 local。只有 local worker 不健康、local 队列深度超过
+`runtime.placement.max_queue_depth`、或 local EWMA p95 超过
+`runtime.placement.max_p95_ms`，并且 remote 可达、`/capabilities` 与本机一致时，
+新 session 才放到 remote。session 创建后 target 固定，后续 chunk 与已有 session
+都不会被 placement 改写；local 恢复只影响之后新建的 session。
+
+每个新 session 的决策在 `/status.placement.decisions` 中，字段包括
+`placement_decision`、`target`、`reason`（`local_first` / `local_unhealthy` /
+`queue_depth` / `p95` / `local_recovered` / `explicit` / `placement_disabled` /
+`remote_unavailable` / `remote_not_configured` / `remote_unsuitable`）、
+`queue_depth`、`p95_ms`。`/status.placement.local` 是当前指标，
+`/status.worker.queue_depth` 是 worker 侧队列深度。`p95_ttl_ms` 过后旧
+p95 视为过期，新 session 会重新探测 local，避免 p95 溢出后永远回不去。
+
+无 GPU、无网络的 CI 可重复跑 10 个预期 placement 决策：
+
+```bash
+python3 actucore/tools/runtime_load.py --json
+```
+
+它启动两个 loopback `motus.vla/1` gateway（local 用 `delay`、remote 用 `mock`），
+退出码只在 10/10 决策匹配时为 0。它验证的是 placement 决策，不是真实 RTX 4060
+或真机延迟；真实硬件的验收测试仍由环境变量显式开启。
+
 ## `navi` 卡片
 
 看到目标就朝它走过去。接 `vop` 的检测结果和一路深度图，输出 `motus.control/1`

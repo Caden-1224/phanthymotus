@@ -38,13 +38,15 @@ class ClosedError(RuntimeError):
 
 
 class Session:
-    def __init__(self, session_id: str, target: str = LOCAL_TARGET):
+    def __init__(self, session_id: str, target: str = LOCAL_TARGET,
+                 placement: dict | None = None):
         self.session_id = session_id
         # A session is pinned to its target for its whole life: switching
         # between machines mid-session would mix action chunks computed from
         # different models and clocks. Placement (#8) may choose remote for a
         # new session, never per chunk.
         self.target = target
+        self._placement = dict(placement or {})
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._state = SessionState.NEW
@@ -135,11 +137,15 @@ class Session:
                 "session_id": self.session_id,
                 "state": self._state.value,
                 "target": self.target,
-                "placement_reason": ("local-first"
-                                     if self.target == LOCAL_TARGET
-                                     else "explicit"),
+                "placement_decision": self._placement.get(
+                    "placement_decision", self.target),
+                "placement_reason": self._placement.get(
+                    "reason", "explicit" if self.target != LOCAL_TARGET
+                    else "local_first"),
+                "queue_depth": self._placement.get("queue_depth", 0),
+                "p95": self._placement.get("p95_ms"),
+                "p95_ms": self._placement.get("p95_ms"),
                 "in_flight": self._in_flight,
-                "queue_depth": 0,
                 "inference_count": self._inference_count,
                 "last_error": self._last_error,
             }
@@ -152,12 +158,12 @@ class SessionRegistry:
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
 
-    def get_or_create(self, session_id: str,
-                      target: str = LOCAL_TARGET) -> Session:
+    def get_or_create(self, session_id: str, target: str = LOCAL_TARGET,
+                      placement: dict | None = None) -> Session:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
-                session = Session(session_id, target)
+                session = Session(session_id, target, placement)
                 self._sessions[session_id] = session
             return session
 
@@ -184,10 +190,13 @@ class SessionRegistry:
             sessions = list(self._sessions.values())
         return [session.snapshot() for session in sessions]
 
-    def mark_all_recovering(self, error: str) -> None:
+    def mark_all_recovering(self, error: str,
+                            target: str | None = None) -> None:
         for session in list(self._sessions.values()):
-            session.mark_recovering(error)
+            if target is None or session.target == target:
+                session.mark_recovering(error)
 
-    def mark_all_ready(self) -> None:
+    def mark_all_ready(self, target: str | None = None) -> None:
         for session in list(self._sessions.values()):
-            session.mark_ready()
+            if target is None or session.target == target:
+                session.mark_ready()

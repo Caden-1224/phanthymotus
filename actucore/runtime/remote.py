@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import collections
 import json
-import math
 import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Callable
+
+from .metrics import p95
 
 # The fields a remote target must agree with the local worker on before it may
 # serve a session. Anything else (ready, n_cameras, ...) describes local state
@@ -81,6 +82,7 @@ class RemoteHTTPBackend:
         self._attempts = collections.deque(maxlen=SAMPLE_WINDOW)
         self._capabilities = None
         self._compatible = None
+        self._health_ok = None
         self._error = ""
 
     # ── backend protocol ─────────────────────────────────────────────────────
@@ -189,10 +191,30 @@ class RemoteHTTPBackend:
 
     # ── observability ────────────────────────────────────────────────────────
 
+    def healthy(self) -> bool:
+        """Reachable, same checkpoint, and its own worker able to infer."""
+        try:
+            self.capabilities(refresh=True)
+            health = self._get("/healthz")
+        except RemoteError:
+            with self._lock:
+                self._health_ok = False
+            return False
+        ok = (self._compatible is True and isinstance(health, dict)
+              and health.get("status") == "ok")
+        with self._lock:
+            self._health_ok = ok
+        return ok
+
+    def control_suitable(self) -> bool | None:
+        """The configured driver-budget verdict, or None when undecided."""
+        return self.latency().get("control_suitable")
+
     def status(self) -> dict:
         return {
             "backend": BACKEND_NAME,
             "endpoint": self._endpoint,
+            "healthy": self._health_ok,
             "compatible": self._compatible,
             "last_error": self._error,
             "latency": self.latency(),
@@ -226,8 +248,8 @@ class RemoteHTTPBackend:
                 f"target for offline or non-control validation only")
             return result
 
-        p95 = _p95(successes)
-        result["p95_rtt_ms"] = round(p95, 1)
+        p95_value = p95(successes)
+        result["p95_rtt_ms"] = round(p95_value, 1)
         if not self._budget_configured:
             result["note"] = (
                 "driver budget not configured; set "
@@ -235,8 +257,8 @@ class RemoteHTTPBackend:
                 "driver descriptor before judging control suitability")
             return result
 
-        within_age = p95 <= self._budget["max_obs_age_ms"]
-        within_watchdog = p95 <= self._budget["watchdog_ms"]
+        within_age = p95_value <= self._budget["max_obs_age_ms"]
+        within_watchdog = p95_value <= self._budget["watchdog_ms"]
         result["within_max_obs_age"] = within_age
         result["within_watchdog"] = within_watchdog
         problems = []
@@ -245,11 +267,11 @@ class RemoteHTTPBackend:
                 f"{failures}/{len(attempts)} remote requests failed")
         if not within_age:
             problems.append(
-                f"p95 {p95:.1f}ms exceeds max_obs_age_ms "
+                f"p95 {p95_value:.1f}ms exceeds max_obs_age_ms "
                 f"{self._budget['max_obs_age_ms']:g}")
         if not within_watchdog:
             problems.append(
-                f"p95 {p95:.1f}ms exceeds watchdog_ms "
+                f"p95 {p95_value:.1f}ms exceeds watchdog_ms "
                 f"{self._budget['watchdog_ms']:g}")
         suitable = not problems
         result["control_suitable"] = suitable
@@ -323,8 +345,3 @@ class RemoteHTTPBackend:
         except Exception:       # noqa: BLE001 — a body is optional decoration
             pass
         return str(error.reason)
-
-
-def _p95(samples: list[float]) -> float:
-    ordered = sorted(samples)
-    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
